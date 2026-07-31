@@ -25,7 +25,7 @@ MAX_ACCOUNTS = 100
 ACCOUNTS_PER_PROXY = 4
 
 # ===== النموذج المستخدم =====
-MODEL = "mistralai/mistral-medium3"
+MODEL = "mistralai/mistral-medium-3"
 
 # ===== أقفال للملفات =====
 proxy_lock = threading.Lock()
