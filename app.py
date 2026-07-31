@@ -16,17 +16,18 @@ app = Flask(__name__)
 # ===== إعدادات الملفات =====
 PROXY_FILE = "proxy.txt"
 ACCOUNTS_FILE = "accounts.json"
-CHECK_INTERVAL = 300  # 5 دقائق لتحديث البروكسيات
+CHECK_INTERVAL = 300
 MAX_WORKERS = 50
 MAX_ACCOUNTS = 100
-API_KEY = "your_secret_api_key_here"  # غيّر هذا
+API_KEY = "your_secret_api_key_here"
 
 # ===== النموذج المستخدم =====
-MODEL = "mistralai/mistral-medium-3"
+MODEL = "mistralai/mistral-medium-3-5"
 
 # ===== قفل للملفات =====
 proxy_lock = threading.Lock()
 account_lock = threading.Lock()
+account_creation_lock = threading.Lock()
 
 # ===== دوال البروكسي =====
 def log(msg):
@@ -58,7 +59,6 @@ def test_proxy(proxy):
             timeout=5
         )
         if r.status_code == 200:
-            print(f"    ✅ يعمل: {proxy}")
             return proxy
     except Exception:
         return None
@@ -71,7 +71,7 @@ def check_list(proxies_list, label=""):
     log(f"جاري فحص {len(proxies_list)} بروكسي ({label})...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         results = executor.map(test_proxy, proxies_list)
-        for proxy, result in zip(proxies_list, results):
+        for result in results:
             if result:
                 working.append(result)
     return working
@@ -101,7 +101,6 @@ def run_cycle():
     log(f"✅ الإجمالي المحفوظ: {len(final_set)} (قديم شغال: {len(still_alive)} | جديد: {len(new_working)})")
 
 def proxy_loop():
-    """حلقة البروكسي المستمرة 24/7"""
     log("بدء التشغيل المستمر للبروكسي 24/7...")
     while True:
         try:
@@ -111,7 +110,7 @@ def proxy_loop():
         log(f"انتظار {CHECK_INTERVAL} ثانية قبل الدورة القادمة...\n")
         time.sleep(CHECK_INTERVAL)
 
-# ===== دوال إنشاء الحسابات =====
+# ===== دوال إنشاء الحسابات (مع تحسينات) =====
 def get_random_proxy_from_file():
     proxies = load_existing()
     if proxies:
@@ -184,63 +183,81 @@ def create_accounts_loop():
     
     while True:
         try:
-            accounts = load_accounts()
-            current_count = len(accounts)
-            
-            if current_count < MAX_ACCOUNTS:
-                needed = MAX_ACCOUNTS - current_count
-                log(f"📝 سيتم إنشاء {needed} حساب للوصول إلى الحد الأقصى")
+            with account_creation_lock:
+                accounts = load_accounts()
+                current_count = len(accounts)
                 
-                accounts_to_create = min(needed, 4)
+                # تنظيف الحسابات المنتهية أولاً
+                active_accounts = []
+                for account in accounts:
+                    try:
+                        response = requests.post(
+                            'https://api.rewind.ai/v1/chat/completions/',
+                            json={
+                                "messages": [{"role": "user", "content": "test"}],
+                                "model": MODEL,
+                                "stream": False
+                            },
+                            headers={
+                                'authorization': f'Bearer {account["access_token"]}',
+                                'content-type': 'application/json',
+                                'x-user-id': account['user_id']
+                            },
+                            timeout=10
+                        )
+                        if response.status_code == 200:
+                            active_accounts.append(account)
+                        elif response.status_code in [401, 429]:
+                            log(f"⚠️ حساب منتهي: {account['email']}")
+                    except:
+                        continue
                 
-                for i in range(accounts_to_create):
-                    proxy = get_random_proxy_from_file()
-                    if proxy:
-                        log(f"🌐 باستخدام بروكسي: {proxy}")
-                    else:
-                        log("⚠️ لا يوجد بروكسي، جاري المحاولة بدون...")
+                if len(active_accounts) != len(accounts):
+                    save_accounts(active_accounts)
+                    log(f"🗑️ تم حذف {len(accounts) - len(active_accounts)} حساب منتهي")
+                    accounts = active_accounts
+                    current_count = len(accounts)
+                
+                # إنشاء حسابات جديدة حتى الوصول إلى 100
+                if current_count < MAX_ACCOUNTS:
+                    needed = MAX_ACCOUNTS - current_count
+                    log(f"📝 سيتم إنشاء {needed} حساب للوصول إلى الحد الأقصى")
                     
-                    log(f"📝 إنشاء حساب {i+1}/{accounts_to_create}...")
-                    account = create_single_account(proxy)
+                    # إنشاء 5 حسابات في كل دورة
+                    accounts_to_create = min(needed, 5)
                     
-                    if account:
-                        accounts.append(account)
-                        save_accounts(accounts)
-                        log(f"✅ تم إنشاء الحساب: {account['email']}")
-                    else:
-                        log(f"❌ فشل إنشاء الحساب - سيتم تغيير البروكسي تلقائياً")
-                    
-                    time.sleep(random.randint(3, 7))
-            
-            # فحص الحسابات وحذف المنتهية
-            accounts = load_accounts()
-            active_accounts = []
-            for account in accounts:
-                try:
-                    response = requests.post(
-                        'https://api.rewind.ai/v1/chat/completions/',
-                        json={
-                            "messages": [{"role": "user", "content": "test"}],
-                            "model": MODEL,
-                            "stream": False
-                        },
-                        headers={
-                            'authorization': f'Bearer {account["access_token"]}',
-                            'content-type': 'application/json',
-                            'x-user-id': account['user_id']
-                        },
-                        timeout=10
-                    )
-                    if response.status_code == 200:
-                        active_accounts.append(account)
-                    elif response.status_code in [401, 429]:
-                        log(f"⚠️ حساب منتهي: {account['email']}")
-                except:
-                    continue
-            
-            if len(active_accounts) != len(accounts):
-                save_accounts(active_accounts)
-                log(f"🗑️ تم حذف {len(accounts) - len(active_accounts)} حساب منتهي")
+                    for i in range(accounts_to_create):
+                        proxy = get_random_proxy_from_file()
+                        if proxy:
+                            log(f"🌐 باستخدام بروكسي: {proxy}")
+                        else:
+                            log("⚠️ لا يوجد بروكسي، جاري المحاولة بدون...")
+                        
+                        log(f"📝 إنشاء حساب {i+1}/{accounts_to_create}...")
+                        account = create_single_account(proxy)
+                        
+                        if account:
+                            accounts = load_accounts()
+                            accounts.append(account)
+                            save_accounts(accounts)
+                            log(f"✅ تم إنشاء الحساب: {account['email']}")
+                            log(f"📁 إجمالي الحسابات: {len(accounts)}")
+                        else:
+                            log(f"❌ فشل إنشاء الحساب - سيتم تغيير البروكسي تلقائياً")
+                            # جرب بروكسي آخر
+                            proxy = get_random_proxy_from_file()
+                            if proxy:
+                                log(f"🔄 محاولة مع بروكسي جديد: {proxy}")
+                                account = create_single_account(proxy)
+                                if account:
+                                    accounts = load_accounts()
+                                    accounts.append(account)
+                                    save_accounts(accounts)
+                                    log(f"✅ تم إنشاء الحساب: {account['email']}")
+                        
+                        time.sleep(random.randint(3, 7))
+                
+                log(f"📊 الحسابات النشطة: {len(load_accounts())} / {MAX_ACCOUNTS}")
             
         except Exception as e:
             log(f"⚠️ خطأ في إنشاء الحسابات: {e}")
@@ -323,7 +340,6 @@ def chat_with_rewind(question, account, history=None):
 
 # ===== وظيفة طباعة الإحصائيات كل دقيقة =====
 def print_stats_loop():
-    """طباعة عدد الحسابات والبروكسيات كل دقيقة"""
     log("📊 بدء طباعة الإحصائيات كل دقيقة...")
     
     while True:
@@ -340,13 +356,11 @@ def print_stats_loop():
             print(f"🔄 حالة الخادم: نشط")
             print("=" * 60)
             
-            # عرض عينة من الحسابات
             if accounts:
                 print("📋 آخر 3 حسابات:")
                 for acc in accounts[-3:]:
-                    print(f"   • {acc.get('email', 'غير معروف')} - {acc.get('proxy', 'بدون بروكسي')}")
+                    print(f"   • {acc.get('email', 'غير معروف')}")
             
-            # عرض عينة من البروكسيات
             if proxies:
                 proxy_list = list(proxies)
                 print(f"\n🌐 عينة من البروكسيات (آخر 3):")
@@ -358,7 +372,7 @@ def print_stats_loop():
         except Exception as e:
             log(f"⚠️ خطأ في طباعة الإحصائيات: {e}")
         
-        time.sleep(60)  # انتظر دقيقة واحدة
+        time.sleep(60)
 
 # ===== واجهة برمجة التطبيقات (API) =====
 @app.route('/chat', methods=['POST'])
@@ -378,9 +392,20 @@ def chat():
     
     history = data.get('history', [])
     
-    account = get_active_account()
+    # محاولة الحصول على حساب مع إعادة المحاولة
+    account = None
+    for attempt in range(3):
+        account = get_active_account()
+        if account:
+            break
+        log(f"⏳ لا يوجد حسابات، انتظر 5 ثوان (محاولة {attempt+1}/3)...")
+        time.sleep(5)
+    
     if not account:
-        return jsonify({"error": "No active accounts available"}), 503
+        return jsonify({
+            "error": "No active accounts available. The system is creating new accounts. Please try again in 2-3 minutes.",
+            "status": "initializing"
+        }), 503
     
     reply = chat_with_rewind(question, account, history)
     
@@ -388,7 +413,10 @@ def chat():
         accounts = load_accounts()
         accounts = [acc for acc in accounts if acc.get('email') != account.get('email')]
         save_accounts(accounts)
-        return jsonify({"error": "Token expired, please try again"}), 401
+        return jsonify({
+            "error": "Token expired, please try again",
+            "status": "retry"
+        }), 401
     
     return jsonify({
         "response": reply,
@@ -413,9 +441,8 @@ def status():
 def health():
     return jsonify({"status": "healthy"}), 200
 
-# ===== تشغيل الخادم والخيوط =====
+# ===== تشغيل الخادم =====
 def start_background_threads():
-    """تشغيل الخيوط الخلفية"""
     proxy_thread = threading.Thread(target=proxy_loop, daemon=True)
     proxy_thread.start()
     log("✅ خيط البروكسي يعمل...")
@@ -430,24 +457,20 @@ def start_background_threads():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 تشغيل خادم الذكاء الاصطناعي")
+    print("🚀 تشغيل خادم الذكاء الاصطناعي - الإصدار المحسن")
     print("=" * 60)
     print("🔄 جلب بروكسيات وفحصها...")
     print("🔄 إنشاء حسابات (الحد الأقصى: 100)...")
     print("📊 طباعة إحصائيات كل دقيقة...")
     print("🧠 النموذج: Mistral Medium 3.5")
-    print("🌐 الخادم يعمل على المنفذ 10000")
     print("=" * 60)
     
-    # تشغيل الخيوط الخلفية
     start_background_threads()
     
-    # عرض الحالة الأولية
     accounts = load_accounts()
     proxies = load_existing()
     print(f"📁 عدد الحسابات: {len(accounts)}")
     print(f"🌐 عدد البروكسيات: {len(proxies)}")
     print("=" * 60)
     
-    # تشغيل الخادم
     app.run(host='0.0.0.0', port=10000)
