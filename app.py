@@ -12,7 +12,6 @@ from flask import Flask, request, jsonify
 # ===== إعدادات الخادم =====
 app = Flask(__name__)
 
-# مفتاح API للتوثيق (يُفضل وضعه في متغيرات البيئة)
 API_KEY = os.environ.get("AI_KEY", "change-me-to-secure-key")
 
 # ===== إعدادات البروكسي =====
@@ -22,11 +21,11 @@ MAX_WORKERS = 50
 
 # ===== إعدادات الحسابات =====
 ACCOUNTS_FILE = "accounts.json"
-MAX_ACCOUNTS = 100          # الحد الأقصى 100 حساب
-ACCOUNTS_PER_PROXY = 4     # عدد الحسابات التي تُنشأ بنفس البروكسي الناجح
+MAX_ACCOUNTS = 100
+ACCOUNTS_PER_PROXY = 4
 
 # ===== النموذج المستخدم =====
-MODEL = "mistralai/mistral-medium-3"
+MODEL = "mistralai/mistral-medium3"
 
 # ===== أقفال للملفات =====
 proxy_lock = threading.Lock()
@@ -35,11 +34,21 @@ account_lock = threading.Lock()
 # ===== التحكم في الحلقات =====
 running = True
 
-# ===== دوال البروكسي (بدون تغيير) =====
-def log(msg):
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {msg}")
+# ===== سجل الأحداث (للعرض عبر API) =====
+log_messages = []  # قائمة بأحدث الرسائل
+MAX_LOG_ENTRIES = 50
 
+def log(msg):
+    """تسجيل رسالة مع وقت، وإضافتها إلى السجل للـ API"""
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"[{now}] {msg}"
+    print(formatted)
+    # إضافة للسجل المشترك
+    log_messages.append(formatted)
+    if len(log_messages) > MAX_LOG_ENTRIES:
+        log_messages.pop(0)
+
+# ===== دوال البروكسي (بدون تغيير) =====
 def get_proxies():
     url = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
     try:
@@ -65,7 +74,7 @@ def test_proxy(proxy):
             timeout=5
         )
         if r.status_code == 200:
-            print(f"    ✅ يعمل: {proxy}")
+            log(f"    ✅ يعمل: {proxy}")
             return proxy
     except Exception:
         return None
@@ -108,10 +117,9 @@ def run_cycle():
     log(f"✅ الإجمالي المحفوظ: {len(final_set)} (قديم شغال: {len(still_alive)} | جديد: {len(new_working)})")
     log("قائمة البروكسيات الشغالة حاليًا:")
     for p in sorted(final_set):
-        print(f"   • {p}")
+        log(f"   • {p}")
 
 def proxy_loop():
-    """حلقة البروكسي المستمرة 24/7"""
     log("بدء التشغيل المستمر للبروكسي 24/7...")
     while running:
         try:
@@ -153,7 +161,6 @@ def save_accounts(accounts):
             json.dump(accounts, f, indent=2, ensure_ascii=False)
 
 def create_single_account(proxy=None):
-    """إنشاء حساب واحد مع بروكسي معين"""
     email = generate_random_email()
     password = generate_random_password()
 
@@ -197,7 +204,6 @@ def create_single_account(proxy=None):
         return None
 
 def create_accounts_loop():
-    """حلقة إنشاء الحسابات - تملأ حتى 100 بالضبط ولا تتجاوزه"""
     log("🔄 بدء حلقة إدارة الحسابات (الحد الأقصى 100)...")
 
     while running:
@@ -206,18 +212,16 @@ def create_accounts_loop():
             current_count = len(accounts)
 
             if current_count >= MAX_ACCOUNTS:
-                # العدد مكتمل، لا حاجة للإنشاء
                 time.sleep(30)
                 continue
 
             needed = MAX_ACCOUNTS - current_count
             log(f"📊 عدد الحسابات الحالي: {current_count} | المطلوب إنشاء: {needed}")
 
-            created_total = 0  # عدد الحسابات التي تم إنشاؤها في هذه الدورة
+            created_total = 0
             last_proxy = None
 
             while created_total < needed and running:
-                # إذا لم يكن لدينا بروكسي حالي أو نريد تغييره، اختر واحداً جديداً
                 if last_proxy is None:
                     proxy = get_random_proxy_from_file()
                     if proxy:
@@ -225,40 +229,33 @@ def create_accounts_loop():
                         last_proxy = proxy
                     else:
                         log("⚠️ لا يوجد بروكسي، المحاولة بدون بروكسي...")
-                        last_proxy = None  # بدون بروكسي
-                    # عداد المحاولات لنفس البروكسي
+                        last_proxy = None
                     attempts_with_current_proxy = 0
 
-                # نحاول إنشاء حساب واحد
                 log(f"📝 محاولة إنشاء حساب ({created_total+1}/{needed})...")
                 account = create_single_account(last_proxy)
 
                 if account:
-                    # نجاح -> أضفه للحسابات
                     accounts.append(account)
                     save_accounts(accounts)
                     created_total += 1
                     attempts_with_current_proxy += 1
                     log(f"✅ تم إنشاء الحساب: {account['email']} | الإجمالي الآن: {len(accounts)}")
 
-                    # إذا وصلنا لعدد الحسابات المطلوب إنشاؤها بنفس البروكسي (4)، ننتقل لبروكسي جديد
                     if attempts_with_current_proxy >= ACCOUNTS_PER_PROXY:
                         log(f"🔄 تم استخدام البروكسي {last_proxy} لإنشاء {ACCOUNTS_PER_PROXY} حسابات، التغيير لبروكسي آخر...")
-                        last_proxy = None  # يجبر على اختيار بروكسي جديد في الدورة القادمة
+                        last_proxy = None
                 else:
-                    # فشل -> تغيير البروكسي فوراً والمحاولة مرة أخرى
                     log(f"❌ فشل إنشاء الحساب باستخدام البروكسي: {last_proxy} - تغيير البروكسي...")
-                    last_proxy = None  # سيتغير في بداية الدورة التالية
-                    # انتظر قليلاً قبل إعادة المحاولة لتجنب الحظر
+                    last_proxy = None
                     time.sleep(random.randint(3, 7))
 
-                # تأخير صغير بين المحاولات لتخفيف الضغط
                 time.sleep(random.randint(2, 5))
 
             if created_total == needed:
                 log(f"🎉 تم الوصول إلى الحد الأقصى {MAX_ACCOUNTS} حساب بنجاح.")
             else:
-                log(f"⚠️ تم إنشاء {created_total} من {needed} حساب. إعادة المحاولة لاحقاً.")
+                log(f"⚠️ تم إنشاء {created_total} من {needed} حساب. إعادة المحاولة لاحقًا.")
 
         except Exception as e:
             log(f"⚠️ خطأ في حلقة إنشاء الحسابات: {e}")
@@ -290,7 +287,6 @@ def get_active_account():
             if response.status_code == 200:
                 return account
             elif response.status_code in [401, 429]:
-                # حساب منتهي أو محظور، إزالته
                 accounts.remove(account)
                 save_accounts(accounts)
         except:
@@ -299,7 +295,6 @@ def get_active_account():
     return None
 
 def chat_with_rewind(question, account, history=None):
-    """التحدث مع الذكاء الاصطناعي باستخدام النموذج المحدد"""
     if not account:
         return "❌ لا يوجد حساب صالح"
 
@@ -347,7 +342,6 @@ def home():
 
 @app.route('/chat', methods=['POST'])
 def chat_api():
-    # التحقق من مفتاح API
     api_key = request.headers.get('X-API-KEY')
     if not api_key or api_key != API_KEY:
         return jsonify({"error": "Invalid or missing API key"}), 403
@@ -357,9 +351,8 @@ def chat_api():
         return jsonify({"error": "Missing 'message' in request body"}), 400
 
     question = data['message']
-    history = data.get('history', [])  # اختياري
+    history = data.get('history', [])
 
-    # الحصول على حساب نشط
     account = get_active_account()
     if not account:
         return jsonify({"error": "No active accounts available"}), 503
@@ -367,7 +360,6 @@ def chat_api():
     reply = chat_with_rewind(question, account, history)
 
     if reply == "TOKEN_EXPIRED":
-        # إزالة الحساب المنتهي والمحاولة مرة أخرى
         accounts = load_accounts()
         accounts = [acc for acc in accounts if acc.get('email') != account.get('email')]
         save_accounts(accounts)
@@ -385,7 +377,6 @@ def chat_api():
 
 @app.route('/status')
 def status_api():
-    # اختياري: يمكن حمايته بنفس مفتاح API
     api_key = request.headers.get('X-API-KEY')
     if not api_key or api_key != API_KEY:
         return jsonify({"error": "Invalid or missing API key"}), 403
@@ -400,14 +391,20 @@ def status_api():
         "status": "running"
     })
 
-# ===== تشغيل الخيوط الخلفية قبل بدء Flask =====
+@app.route('/logs')
+def logs_api():
+    """إرجاع آخر رسائل السجل (للإطلاع على إنشاء الحسابات والبروكسيات)"""
+    api_key = request.headers.get('X-API-KEY')
+    if not api_key or api_key != API_KEY:
+        return jsonify({"error": "Invalid or missing API key"}), 403
+    return jsonify({"logs": log_messages})
+
+# ===== تشغيل الخيوط الخلفية =====
 def start_background_threads():
-    # خيط البروكسي
     proxy_thread = threading.Thread(target=proxy_loop, daemon=True)
     proxy_thread.start()
     log("✅ خيط البروكسي يعمل...")
 
-    # خيط إدارة الحسابات (حتى 100)
     account_thread = threading.Thread(target=create_accounts_loop, daemon=True)
     account_thread.start()
     log("✅ خيط إنشاء الحسابات يعمل (الحد الأقصى 100)...")
@@ -419,10 +416,8 @@ if __name__ == "__main__":
     print(f"🧠 النموذج: {MODEL}")
     print(f"🔑 مفتاح API: {API_KEY}")
     print(f"📁 الحد الأقصى للحسابات: {MAX_ACCOUNTS}")
-    print("🔄 بدء الخيوط الخلفية...")
     start_background_threads()
     print("🌐 الخادم يعمل على المنفذ 10000")
     print("=" * 60)
 
-    # تشغيل تطبيق Flask
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
