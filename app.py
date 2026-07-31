@@ -8,6 +8,7 @@ import json
 import random
 import string
 import threading
+import sys
 
 # ===== إعدادات الخادم =====
 app = Flask(__name__)
@@ -17,8 +18,8 @@ PROXY_FILE = "proxy.txt"
 ACCOUNTS_FILE = "accounts.json"
 CHECK_INTERVAL = 300  # 5 دقائق لتحديث البروكسيات
 MAX_WORKERS = 50
-MAX_ACCOUNTS = 100  # الحد الأقصى لعدد الحسابات
-API_KEY = "your_secret_api_key_here"  # غيّر هذا إلى مفتاح سري
+MAX_ACCOUNTS = 100
+API_KEY = "your_secret_api_key_here"  # غيّر هذا
 
 # ===== النموذج المستخدم =====
 MODEL = "mistralai/mistral-medium-3"
@@ -185,15 +186,12 @@ def create_accounts_loop():
         try:
             accounts = load_accounts()
             current_count = len(accounts)
-            log(f"📁 عدد الحسابات الحالية: {current_count}")
             
             if current_count < MAX_ACCOUNTS:
-                # حساب عدد الحسابات المطلوب إنشاؤها للوصول إلى 100
                 needed = MAX_ACCOUNTS - current_count
                 log(f"📝 سيتم إنشاء {needed} حساب للوصول إلى الحد الأقصى")
                 
-                # إنشاء 4 حسابات فقط لكل بروكسي ناجح
-                accounts_to_create = min(needed, 4)  # 4 حسابات كحد أقصى لكل دورة
+                accounts_to_create = min(needed, 4)
                 
                 for i in range(accounts_to_create):
                     proxy = get_random_proxy_from_file()
@@ -209,13 +207,10 @@ def create_accounts_loop():
                         accounts.append(account)
                         save_accounts(accounts)
                         log(f"✅ تم إنشاء الحساب: {account['email']}")
-                        log(f"📁 إجمالي الحسابات الآن: {len(accounts)}")
                     else:
                         log(f"❌ فشل إنشاء الحساب - سيتم تغيير البروكسي تلقائياً")
                     
                     time.sleep(random.randint(3, 7))
-            else:
-                log("✅ تم الوصول إلى الحد الأقصى (100 حساب)")
             
             # فحص الحسابات وحذف المنتهية
             accounts = load_accounts()
@@ -326,16 +321,53 @@ def chat_with_rewind(question, account, history=None):
     except Exception as e:
         return f"❌ خطأ: {str(e)}"
 
+# ===== وظيفة طباعة الإحصائيات كل دقيقة =====
+def print_stats_loop():
+    """طباعة عدد الحسابات والبروكسيات كل دقيقة"""
+    log("📊 بدء طباعة الإحصائيات كل دقيقة...")
+    
+    while True:
+        try:
+            accounts = load_accounts()
+            proxies = load_existing()
+            
+            print("\n" + "=" * 60)
+            print(f"📊 إحصائيات النظام - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print("=" * 60)
+            print(f"📁 عدد الحسابات: {len(accounts)} / {MAX_ACCOUNTS}")
+            print(f"🌐 عدد البروكسيات: {len(proxies)}")
+            print(f"🧠 النموذج: {MODEL}")
+            print(f"🔄 حالة الخادم: نشط")
+            print("=" * 60)
+            
+            # عرض عينة من الحسابات
+            if accounts:
+                print("📋 آخر 3 حسابات:")
+                for acc in accounts[-3:]:
+                    print(f"   • {acc.get('email', 'غير معروف')} - {acc.get('proxy', 'بدون بروكسي')}")
+            
+            # عرض عينة من البروكسيات
+            if proxies:
+                proxy_list = list(proxies)
+                print(f"\n🌐 عينة من البروكسيات (آخر 3):")
+                for p in proxy_list[-3:]:
+                    print(f"   • {p}")
+            
+            print("=" * 60 + "\n")
+            
+        except Exception as e:
+            log(f"⚠️ خطأ في طباعة الإحصائيات: {e}")
+        
+        time.sleep(60)  # انتظر دقيقة واحدة
+
 # ===== واجهة برمجة التطبيقات (API) =====
 @app.route('/chat', methods=['POST'])
 def chat():
-    """استقبال طلبات المحادثة"""
     data = request.get_json()
     
     if not data:
         return jsonify({"error": "Invalid request, JSON expected"}), 400
     
-    # التحقق من المفتاح
     api_key = data.get('api_key')
     if api_key != API_KEY:
         return jsonify({"error": "Invalid API key"}), 401
@@ -344,16 +376,15 @@ def chat():
     if not question:
         return jsonify({"error": "Message is required"}), 400
     
-    # الحصول على حساب نشط
+    history = data.get('history', [])
+    
     account = get_active_account()
     if not account:
         return jsonify({"error": "No active accounts available"}), 503
     
-    # الحصول على الرد
-    reply = chat_with_rewind(question, account, None)
+    reply = chat_with_rewind(question, account, history)
     
     if reply == "TOKEN_EXPIRED":
-        # حذف الحساب المنتهي
         accounts = load_accounts()
         accounts = [acc for acc in accounts if acc.get('email') != account.get('email')]
         save_accounts(accounts)
@@ -367,7 +398,6 @@ def chat():
 
 @app.route('/status', methods=['GET'])
 def status():
-    """عرض حالة النظام"""
     accounts = load_accounts()
     proxies = load_existing()
     
@@ -381,10 +411,9 @@ def status():
 
 @app.route('/health', methods=['GET'])
 def health():
-    """فحص صحة الخادم"""
     return jsonify({"status": "healthy"}), 200
 
-# ===== تشغيل الخادم والخيوط الخلفية =====
+# ===== تشغيل الخادم والخيوط =====
 def start_background_threads():
     """تشغيل الخيوط الخلفية"""
     proxy_thread = threading.Thread(target=proxy_loop, daemon=True)
@@ -394,6 +423,10 @@ def start_background_threads():
     account_thread = threading.Thread(target=create_accounts_loop, daemon=True)
     account_thread.start()
     log("✅ خيط إنشاء الحسابات يعمل...")
+    
+    stats_thread = threading.Thread(target=print_stats_loop, daemon=True)
+    stats_thread.start()
+    log("✅ خيط طباعة الإحصائيات يعمل...")
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -401,6 +434,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("🔄 جلب بروكسيات وفحصها...")
     print("🔄 إنشاء حسابات (الحد الأقصى: 100)...")
+    print("📊 طباعة إحصائيات كل دقيقة...")
     print("🧠 النموذج: Mistral Medium 3.5")
     print("🌐 الخادم يعمل على المنفذ 10000")
     print("=" * 60)
@@ -408,7 +442,7 @@ if __name__ == "__main__":
     # تشغيل الخيوط الخلفية
     start_background_threads()
     
-    # عرض الحالة
+    # عرض الحالة الأولية
     accounts = load_accounts()
     proxies = load_existing()
     print(f"📁 عدد الحسابات: {len(accounts)}")
